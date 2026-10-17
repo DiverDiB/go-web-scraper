@@ -6,8 +6,19 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 )
+
+type config struct {
+	pages              map[string]PageData
+	baseURL            *url.URL
+	mu                 *sync.Mutex
+	concurrencyControl chan struct{}
+	wg                 *sync.WaitGroup
+	maxPages           int
+}
 
 func main() {
 	args := os.Args[1:]
@@ -16,23 +27,84 @@ func main() {
 	if len(args) < 1 {
 		fmt.Println("no website provided")
 		os.Exit(1)
+	} else if len(args) < 2 {
+		fmt.Println("no maximum concurrency provided")
+		os.Exit(1)
+	} else if len(args) < 3 {
+		fmt.Println("no maximum pages provided")
+		os.Exit(1)
 	}
 
-	if len(args) > 1 {
+	if len(args) > 3 {
 		fmt.Println("too many arguments provided")
 		os.Exit(1)
 	}
 
-	baseURL := args[0]
-	fmt.Printf("starting crawl of: %s\n", baseURL)
+	rawBaseURL := args[0]
+	fmt.Printf("starting crawl of: %s\n", rawBaseURL)
 
-	pages := make(map[string]int)
-	crawlPage(baseURL, baseURL, pages)
-
-	fmt.Println("\n--- Final Crawl Results ---")
-	for page, count := range pages {
-		fmt.Printf("Found %d internal links to %s\n", count, page)
+	parsedBaseURL, err := url.Parse(rawBaseURL)
+	//fmt.Printf("base url = %s\n", rawBaseURL)
+	if err != nil {
+		fmt.Printf("error parsing base URL: %v\n", err)
+		os.Exit(1)
 	}
+
+	maxConcurrency, err := strconv.Atoi(args[1])
+	//fmt.Printf("maxConcurrency = %d\n", maxConcurrency)
+	if err != nil {
+		fmt.Printf("error parsing maxConcurrency: %v\n", err)
+		os.Exit(1)
+	}
+
+	maxPagesArg, err := strconv.Atoi(args[2])
+	//fmt.Printf("maxPages = %d\n", maxPagesArg)
+	if err != nil {
+		fmt.Printf("error parsing maxPages: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Initialize the configuration structure
+	cfg := &config{
+		pages:              make(map[string]PageData),
+		baseURL:            parsedBaseURL,
+		mu:                 &sync.Mutex{},
+		concurrencyControl: make(chan struct{}, maxConcurrency),
+		wg:                 &sync.WaitGroup{},
+		maxPages:           maxPagesArg,
+	}
+
+	// Kick off the first crawl
+	cfg.wg.Add(1)
+	go func() {
+		defer cfg.wg.Done()
+		cfg.crawlPage(rawBaseURL)
+	}()
+
+	// Wait for all concurrent goroutines to finish
+	cfg.wg.Wait()
+
+	// Print out the final results
+	//fmt.Println("\n--- Final Crawl Results ---")
+	//for normalizedURL, pageData := range cfg.pages {
+	//	fmt.Printf("Found page: %s (Heading: %s) with %d outgoing links\n", normalizedURL, pageData.Heading, len(pageData.OutgoingLinks))
+	//}
+
+	writeJSONReport(cfg.pages, "report.json")
+}
+
+func (cfg *config) addPageVisit(normalizedURL string) (shouldVisit bool) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	// Check if the page is already in our map
+	if _, visited := cfg.pages[normalizedURL]; visited {
+		return false // already visited, skip it
+	}
+
+	// Mark it as visited (we can initialize it with an empty PageData for now)
+	cfg.pages[normalizedURL] = PageData{}
+	return true // first time seeing it, go ahead and crawl
 }
 
 func getHTML(rawURL string) (string, error) {
@@ -74,69 +146,67 @@ func getHTML(rawURL string) (string, error) {
 	return string(bodyBytes), nil
 }
 
-func crawlPage(rawBaseURL string, rawCurrentURL string, pages map[string]int) {
-	// Make sure rawCurrentURL is on the same doman as rawBaseURL
-	baseURLParsed, err := url.Parse(rawBaseURL)
-	//fmt.Printf("baseURLParsed = %s\n", baseURLParsed)
+func (cfg *config) crawlPage(rawCurrentURL string) {
+	// Return if max pages is exceeded
+	cfg.mu.Lock()
+	if len(cfg.pages) >= cfg.maxPages {
+		cfg.mu.Unlock()
+		return
+	}
+	cfg.mu.Unlock()
+
+	// Parse and normalize the URL
+	parsedURL, err := url.Parse(rawCurrentURL)
 	if err != nil {
-		fmt.Printf("error parsing base URL: %v\n", err)
+		fmt.Printf("error parsing URL: %v\n", err)
 		return
 	}
 
-	currentURLParsed, err := url.Parse(rawCurrentURL)
-	//fmt.Printf("currentURLParsed = %s\n", currentURLParsed)
+	// Ensure we only crawl pages on the same domain/site
+	if parsedURL.Hostname() != cfg.baseURL.Hostname() {
+		return
+	}
+
+	normalizedURL, err := normalizeURL(rawCurrentURL)
 	if err != nil {
-		fmt.Printf("error parsing current URL: %v\n", err)
-		return
+		fmt.Printf("error normalizing URL: %v\n", err)
 	}
 
-	if baseURLParsed.Hostname() != currentURLParsed.Hostname() {
-		fmt.Println("URLs are not on the same domain")
-		return
+	// Use our Mutex-protected helper method to check and claim the visit
+	if !cfg.addPageVisit(normalizedURL) {
+		return // if returns false, another goroutine already got to it
 	}
 
-	// Get a normalized version of the rawCurrentURL
-	normalizedCurrent, err := normalizeURL(rawCurrentURL)
-	//fmt.Printf("normalizedCurrent = %s\n", normalizedCurrent)
-	if err != nil {
-		fmt.Printf("error normalizing URL '%s': %v\n", rawCurrentURL, err)
-		return
-	}
-
-	// If already visited, increment count and return
-	if _, exists := pages[normalizedCurrent]; exists {
-		pages[normalizedCurrent]++
-		return
-	}
-
-	// Otherwise, add to map with a count of 1
-	pages[normalizedCurrent] = 1
-
-	// Get the HTML from the current URL with a live print statement
+	// If we got true, we are the lucky goroutine tasked with fetching it!
 	fmt.Printf("crawling: %s\n", rawCurrentURL)
+
 	htmlBody, err := getHTML(rawCurrentURL)
 	if err != nil {
 		fmt.Printf("error getting HTML for %s: %v\n", rawCurrentURL, err)
 		return
 	}
 
-	// Parse the rawBaseURL into a *url.URL object
-	baseURLParsedObj, err := url.Parse(rawBaseURL)
-	if err != nil {
-		fmt.Printf("error parsing base URL for link extraction: %v\n", err)
-		return
-	}
+	// Extract links from the page
+	pageData := extractPageData(htmlBody, rawCurrentURL)
 
-	// Get all URLs from the response body HTML using the parsed URL
-	nextURLs, err := getURLsFromHTML(htmlBody, baseURLParsedObj)
-	//fmt.Printf("nextURLs = %v\n", nextURLs)
-	if err != nil {
-		fmt.Printf("error extracting URLs from %s: %v\n", rawCurrentURL, err)
-		return
-	}
+	// Safely store the page data in the shared map using the mutex
+	cfg.mu.Lock()
+	cfg.pages[normalizedURL] = pageData
+	cfg.mu.Unlock()
 
-	// Recursively crawl each URL found on the page
-	for _, nextURL := range nextURLs {
-		crawlPage(rawBaseURL, nextURL, pages)
+	// Loop through the outgoing links and spawn new concurrent goroutines
+	for _, nextURL := range pageData.OutgoingLinks {
+		cfg.wg.Add(1)
+		go func(urlToCrawl string) {
+			// Ensure token cleanup and WaitGroup decrement happen no matter what
+			defer func() {
+				<-cfg.concurrencyControl
+				cfg.wg.Done()
+			}()
+
+			cfg.concurrencyControl <- struct{}{}
+
+			cfg.crawlPage(urlToCrawl)
+		}(nextURL)
 	}
 }
